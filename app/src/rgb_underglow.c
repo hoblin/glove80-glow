@@ -8,6 +8,7 @@
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/random/random.h>
 
 #include <math.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #include <zmk/activity.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
+#include <zmk/events/position_state_changed.h>
 #include <zmk/events/usb_conn_state_changed.h>
 #include <zmk/workqueue.h>
 
@@ -47,6 +49,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define STRIP_CHOSEN DT_CHOSEN(zmk_underglow)
 #define STRIP_NUM_PIXELS DT_PROP(STRIP_CHOSEN, chain_length)
 
+#define UNDERGLOW_KEYS DT_PATH(underglow_keys)
+#define UNDERGLOW_KEYS_ENABLED DT_NODE_EXISTS(UNDERGLOW_KEYS)
+
 #define HUE_MAX 360
 #define SAT_MAX 100
 #define BRT_MAX 100
@@ -59,6 +64,11 @@ enum rgb_underglow_effect {
     UNDERGLOW_EFFECT_BREATHE,
     UNDERGLOW_EFFECT_SPECTRUM,
     UNDERGLOW_EFFECT_SWIRL,
+#if UNDERGLOW_KEYS_ENABLED
+    UNDERGLOW_EFFECT_PRESS,
+    UNDERGLOW_EFFECT_PRESS_RAINBOW,
+    UNDERGLOW_EFFECT_PRESS_GLOW,
+#endif
     UNDERGLOW_EFFECT_NUMBER // Used to track number of underglow effects
 };
 
@@ -78,6 +88,8 @@ static struct led_rgb pixels[STRIP_NUM_PIXELS];
 static struct led_rgb status_pixels[STRIP_NUM_PIXELS];
 
 static struct rgb_underglow_state state;
+
+static bool strip_idle;
 
 #if IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_EXT_POWER)
 static const struct device *const ext_power = DEVICE_DT_GET(DT_INST(0, zmk_ext_power_generic));
@@ -189,6 +201,71 @@ static void zmk_rgb_underglow_effect_swirl(void) {
     state.animation_step += state.animation_speed * 2;
     state.animation_step = state.animation_step % HUE_MAX;
 }
+
+#if UNDERGLOW_KEYS_ENABLED
+#define KEY_GLOW_MAX UINT8_MAX
+#define KEY_FADE_MS 400
+#define KEY_IDLE_MS 2000
+
+struct key_glow {
+    uint8_t level;
+    bool held;
+    uint16_t hue;
+};
+
+static const uint8_t key_leds[] = DT_PROP(UNDERGLOW_KEYS, leds);
+static struct key_glow key_glows[STRIP_NUM_PIXELS];
+static int64_t key_lit_at;
+
+static bool zmk_rgb_underglow_effect_press(uint8_t background, uint8_t peak, bool rainbow) {
+    bool lit = false;
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct key_glow *glow = &key_glows[i];
+        struct zmk_led_hsb hsb = state.color;
+
+        if (rainbow) {
+            hsb.h = glow->hue;
+        }
+        hsb.b = background +
+                (peak - background) * glow->level * glow->level / (KEY_GLOW_MAX * KEY_GLOW_MAX);
+        pixels[i] = hsb_to_rgb(hsb);
+
+        if (!glow->held) {
+            glow->level = MAX(glow->level - KEY_GLOW_MAX * 25 / KEY_FADE_MS, 0);
+        }
+        lit |= glow->level > 0;
+    }
+
+    int64_t now = k_uptime_get();
+    if (lit) {
+        key_lit_at = now;
+    }
+
+    return background == 0 && now - key_lit_at > KEY_IDLE_MS;
+}
+
+static int rgb_underglow_key_listener(const zmk_event_t *eh) {
+    const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
+
+    if (ev->source != ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL ||
+        ev->position >= ARRAY_SIZE(key_leds)) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    struct key_glow *glow = &key_glows[key_leds[ev->position]];
+    glow->held = ev->state;
+    if (ev->state) {
+        glow->level = KEY_GLOW_MAX;
+        glow->hue = sys_rand32_get() % HUE_MAX;
+    }
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(rgb_underglow_keys, rgb_underglow_key_listener);
+ZMK_SUBSCRIPTION(rgb_underglow_keys, zmk_position_state_changed);
+#endif
 
 static int zmk_led_generate_status(void);
 
@@ -420,6 +497,8 @@ static int zmk_led_generate_status(void) {
 #endif // underglow_indicators exists
 
 static void zmk_rgb_underglow_tick(struct k_work *work) {
+    bool idle = false;
+
     switch (state.current_effect) {
     case UNDERGLOW_EFFECT_SOLID:
         zmk_rgb_underglow_effect_solid();
@@ -433,9 +512,28 @@ static void zmk_rgb_underglow_tick(struct k_work *work) {
     case UNDERGLOW_EFFECT_SWIRL:
         zmk_rgb_underglow_effect_swirl();
         break;
+#if UNDERGLOW_KEYS_ENABLED
+    case UNDERGLOW_EFFECT_PRESS:
+        idle = zmk_rgb_underglow_effect_press(0, hsb_scale_min_max(state.color).b, false);
+        break;
+    case UNDERGLOW_EFFECT_PRESS_RAINBOW:
+        idle = zmk_rgb_underglow_effect_press(0, hsb_scale_min_max(state.color).b, true);
+        break;
+    case UNDERGLOW_EFFECT_PRESS_GLOW:
+        idle = zmk_rgb_underglow_effect_press(hsb_scale_min_max(state.color).b,
+                                              CONFIG_ZMK_RGB_UNDERGLOW_BRT_MAX, false);
+        break;
+#endif
     }
 
-    zmk_led_write_pixels();
+    if (idle != strip_idle) {
+        strip_idle = idle;
+        zmk_rgb_set_ext_power();
+    }
+
+    if (!idle) {
+        zmk_led_write_pixels();
+    }
 }
 
 K_WORK_DEFINE(underglow_tick_work, zmk_rgb_underglow_tick);
@@ -547,7 +645,7 @@ void zmk_rgb_set_ext_power(void) {
         LOG_ERR("Unable to examine EXT_POWER: %d", c_power);
         c_power = 0;
     }
-    int desired_state = state.on || state.status_active;
+    int desired_state = (state.on && !strip_idle) || state.status_active;
 
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
     // force power off, when battery low (<10%)

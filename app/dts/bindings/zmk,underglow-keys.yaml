@@ -1,0 +1,11 @@
+# Copyright (c) 2026, The ZMK Contributors
+# SPDX-License-Identifier: MIT
+
+description: Underglow LED under each key position, numbered on the key's own half
+
+compatible: "zmk,underglow-keys"
+
+properties:
+  leds:
+    type: array
+    required: true
