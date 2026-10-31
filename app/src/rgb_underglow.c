@@ -49,8 +49,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define STRIP_CHOSEN DT_CHOSEN(zmk_underglow)
 #define STRIP_NUM_PIXELS DT_PROP(STRIP_CHOSEN, chain_length)
 
-#define UNDERGLOW_KEYS DT_PATH(underglow_keys)
-#define UNDERGLOW_KEYS_ENABLED DT_NODE_EXISTS(UNDERGLOW_KEYS)
+#define UNDERGLOW_KEYS DT_INST(0, zmk_underglow_keys)
+#define UNDERGLOW_KEYS_ENABLED DT_HAS_COMPAT_STATUS_OKAY(zmk_underglow_keys)
 
 #define HUE_MAX 360
 #define SAT_MAX 100
@@ -203,46 +203,38 @@ static void zmk_rgb_underglow_effect_swirl(void) {
 }
 
 #if UNDERGLOW_KEYS_ENABLED
-#define KEY_GLOW_MAX UINT8_MAX
 #define KEY_FADE_MS 400
 #define KEY_IDLE_MS 2000
 
 struct key_glow {
-    uint8_t level;
     bool held;
     uint16_t hue;
+    int64_t released_at;
 };
 
 static const uint8_t key_leds[] = DT_PROP(UNDERGLOW_KEYS, leds);
 static struct key_glow key_glows[STRIP_NUM_PIXELS];
-static int64_t key_lit_at;
+static int64_t keys_released_at;
 
 static bool zmk_rgb_underglow_effect_press(uint8_t background, uint8_t peak, bool rainbow) {
-    bool lit = false;
+    int64_t now = k_uptime_get();
+    bool held = false;
 
     for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
         struct key_glow *glow = &key_glows[i];
         struct zmk_led_hsb hsb = state.color;
+        int glow_ms = glow->held ? KEY_FADE_MS : MAX(KEY_FADE_MS - (now - glow->released_at), 0);
 
         if (rainbow) {
             hsb.h = glow->hue;
         }
-        hsb.b = background +
-                (peak - background) * glow->level * glow->level / (KEY_GLOW_MAX * KEY_GLOW_MAX);
+        hsb.b = background + (peak - background) * glow_ms * glow_ms / (KEY_FADE_MS * KEY_FADE_MS);
         pixels[i] = hsb_to_rgb(hsb);
 
-        if (!glow->held) {
-            glow->level = MAX(glow->level - KEY_GLOW_MAX * 25 / KEY_FADE_MS, 0);
-        }
-        lit |= glow->level > 0;
+        held |= glow->held;
     }
 
-    int64_t now = k_uptime_get();
-    if (lit) {
-        key_lit_at = now;
-    }
-
-    return background == 0 && now - key_lit_at > KEY_IDLE_MS;
+    return background == 0 && !held && now - keys_released_at > KEY_IDLE_MS;
 }
 
 static int rgb_underglow_key_listener(const zmk_event_t *eh) {
@@ -254,18 +246,20 @@ static int rgb_underglow_key_listener(const zmk_event_t *eh) {
     }
 
     struct key_glow *glow = &key_glows[key_leds[ev->position]];
-    glow->held = ev->state;
     if (ev->state) {
-        glow->level = KEY_GLOW_MAX;
         glow->hue = sys_rand32_get() % HUE_MAX;
+    } else {
+        glow->released_at = ev->timestamp;
+        keys_released_at = ev->timestamp;
     }
+    glow->held = ev->state;
 
     return ZMK_EV_EVENT_BUBBLE;
 }
 
 ZMK_LISTENER(rgb_underglow_keys, rgb_underglow_key_listener);
 ZMK_SUBSCRIPTION(rgb_underglow_keys, zmk_position_state_changed);
-#endif
+#endif // UNDERGLOW_KEYS_ENABLED
 
 static int zmk_led_generate_status(void);
 
@@ -526,10 +520,8 @@ static void zmk_rgb_underglow_tick(struct k_work *work) {
 #endif
     }
 
-    if (idle != strip_idle) {
-        strip_idle = idle;
-        zmk_rgb_set_ext_power();
-    }
+    strip_idle = idle;
+    zmk_rgb_set_ext_power();
 
     if (!idle) {
         zmk_led_write_pixels();
