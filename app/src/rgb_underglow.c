@@ -89,10 +89,14 @@ static struct led_rgb status_pixels[STRIP_NUM_PIXELS];
 
 static struct rgb_underglow_state state;
 
-static bool strip_idle;
+static bool strip_idle = true;
+static int64_t strip_woke_at;
 
 #if IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_EXT_POWER)
 static const struct device *const ext_power = DEVICE_DT_GET(DT_INST(0, zmk_ext_power_generic));
+#define STRIP_POWER_UP_MS DT_PROP_OR(DT_INST(0, zmk_ext_power_generic), init_delay_ms, 0)
+#else
+#define STRIP_POWER_UP_MS 0
 #endif
 
 void zmk_rgb_set_ext_power(void);
@@ -211,6 +215,10 @@ struct key_glow {
     uint16_t hue;
     int64_t released_at;
 };
+
+#define KEY_LED_ON_STRIP(node, prop, idx) &&(DT_PROP_BY_IDX(node, prop, idx) < STRIP_NUM_PIXELS)
+BUILD_ASSERT(1 DT_FOREACH_PROP_ELEM(UNDERGLOW_KEYS, leds, KEY_LED_ON_STRIP),
+             "ERROR: underglow-keys names an LED beyond the strip");
 
 static const uint8_t key_leds[] = DT_PROP(UNDERGLOW_KEYS, leds);
 static struct key_glow key_glows[STRIP_NUM_PIXELS];
@@ -520,10 +528,13 @@ static void zmk_rgb_underglow_tick(struct k_work *work) {
 #endif
     }
 
-    strip_idle = idle;
-    zmk_rgb_set_ext_power();
+    if (idle != strip_idle) {
+        strip_idle = idle;
+        strip_woke_at = k_uptime_get();
+        zmk_rgb_set_ext_power();
+    }
 
-    if (!idle) {
+    if (!idle && k_uptime_get() - strip_woke_at >= STRIP_POWER_UP_MS) {
         zmk_led_write_pixels();
     }
 }
@@ -598,6 +609,13 @@ static int zmk_rgb_underglow_init(void) {
 
 #if IS_ENABLED(CONFIG_SETTINGS)
     k_work_init_delayable(&underglow_save_work, zmk_rgb_underglow_save_state_work);
+#endif
+
+#if UNDERGLOW_KEYS_ENABLED
+    keys_released_at = -KEY_IDLE_MS;
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        key_glows[i].released_at = -KEY_IDLE_MS;
+    }
 #endif
 
 #if IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_AUTO_OFF_USB)
