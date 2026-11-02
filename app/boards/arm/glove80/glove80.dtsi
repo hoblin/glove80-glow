@@ -37,6 +37,18 @@
         >;
     };
 
+    underglow-keys {
+        compatible = "zmk,underglow-keys";
+        leds = <
+            34 28 22 16 10                               10 16 22 28 34
+            35 29 23 17 11  6                          6 11 17 23 29 35
+            36 30 24 18 12  7                          7 12 18 24 30 36
+            37 31 25 19 13  8                          8 13 19 25 31 37
+            38 32 26 20 14  9    0  1  2    2  1  0    9 14 20 26 32 38
+            39 33 27 21 15       3  4  5    5  4  3      15 21 27 33 39
+        >;
+    };
+
     kscan0: kscan {
         compatible = "zmk,kscan-gpio-matrix";
         wakeup-source;
